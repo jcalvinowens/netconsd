@@ -39,7 +39,7 @@ static void handle_listen_error(int err)
 
 static struct msg_buf *msgbuf_from_iovec(struct iovec *vecptr)
 {
-	return container_of(vecptr, struct msg_buf, iovec);
+	return caa_container_of(vecptr, struct msg_buf, iovec);
 }
 
 static unsigned long hash_srcaddr(struct in6_addr *addr)

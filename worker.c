@@ -14,6 +14,10 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 
+#include <urcu/urcu-qsbr.h>
+#include <urcu/rculfhash.h>
+#include <urcu/list.h>
+
 #include <ncrx.h>
 
 #include "include/common.h"
@@ -28,29 +32,6 @@ static const struct ncrx_param ncrx_param = {
 	.oos_timeout = NETCONS_RTO,
 };
 
-/*
- * Keep it simple: just use a boring probing hashtable that resizes.
- */
-
-struct timerlist {
-	struct timerlist *prev;
-	struct timerlist *next;
-	uint64_t when;
-};
-
-struct bucket {
-	struct in6_addr src;
-	struct ncrx *ncrx;
-	uint64_t last_seen;
-	struct timerlist timernode;
-};
-
-struct hashtable {
-	unsigned long order;
-	unsigned long load;
-	struct bucket table[];
-};
-
 static unsigned long hash_srcaddr(struct in6_addr *addr)
 {
 	uint32_t *addrptr = (uint32_t *)addr;
@@ -58,39 +39,19 @@ static unsigned long hash_srcaddr(struct in6_addr *addr)
 	return jhash2(addrptr, sizeof(*addr) / sizeof(*addrptr), WORKER_SEED);
 }
 
-static unsigned long order_mask(int order)
+static int lfht_match_srcaddr(struct cds_lfht_node *node, const void *key)
 {
-	return (1UL << order) - 1;
+	struct bucket *bkt = caa_container_of(node, struct bucket, lfht_node);
+	struct in6_addr *src = key;
+
+	return memcmp(bkt->src, src) == 0;
 }
 
-static unsigned long htable_mask(unsigned long hash, int order)
+static struct bucket *hlookup(struct cds_lfht *hashtable, struct in6_addr *src)
 {
-	return hash & order_mask(order);
-}
+	struct cds_lfht_node *ret;
 
-static unsigned long htable_hash(struct hashtable *h, struct in6_addr *s)
-{
-	return htable_mask(hash_srcaddr(s), h->order);
-}
-
-static int srcaddr_compar(struct in6_addr *a, struct in6_addr *b)
-{
-	return memcmp(a, b, sizeof(*a));
-}
-
-static struct bucket *hlookup(struct hashtable *h, struct in6_addr *src)
-{
-	unsigned long origidx, idx;
-
-	origidx = htable_hash(h, src);
-	idx = origidx;
-
-	while (h->table[idx].ncrx && srcaddr_compar(&h->table[idx].src, src)) {
-		idx = htable_mask(idx + 1, h->order);
-		fatal_on(idx == origidx, "Worker hashtable is full\n");
-	}
-
-	return &h->table[idx];
+	// FIXME
 }
 
 /*
@@ -135,63 +96,25 @@ static const struct timespec *next_waketime(struct ncrx_worker *cur)
 	return &cur->wake;
 }
 
-static struct bucket *bucket_from_timernode(struct timerlist *node)
+static struct bucket *bucket_from_timernode(struct cds_list_head *node)
 {
-	return container_of(node, struct bucket, timernode);
-}
-
-static void timerlist_init(struct timerlist *node)
-{
-	node->next = node;
-	node->prev = node;
-	node->when = 0;
-}
-
-static int timerlist_empty(struct timerlist *node)
-{
-	return node->next == node;
-}
-
-static void timerlist_append(struct timerlist *node, struct timerlist *list)
-{
-	struct timerlist *prev = list->prev;
-
-	fatal_on(!timerlist_empty(node), "Queueing node already on list\n");
-
-	node->next = list;
-	node->prev = prev;
-	prev->next = node;
-	list->prev = node;
-}
-
-static void timerlist_del(struct timerlist *node)
-{
-	struct timerlist *prev = node->prev;
-	struct timerlist *next = node->next;
-
-	prev->next = next;
-	next->prev = prev;
-	timerlist_init(node);
+	return caa_container_of(node, struct bucket, timer_node);
 }
 
 /*
  * Return the callback time of the newest item on the list
  */
-static uint64_t timerlist_peek(struct timerlist *list)
+static uint64_t timerlist_peek(struct cds_list_head *list)
 {
-	if (timerlist_empty(list))
+	if (cds_list_empty(list))
 		return 0;
 
-	return list->prev->when;
+	return list->prev->timer_expiry;
 }
 
-#define timerlist_for_each(this, n, thead) \
-	for (this = (thead)->next, n = this->next; this != (thead); \
-		this = n, n = this->next)
-
-static struct timerlist *create_timerlists(void)
+static struct cds_list_head *create_timerlists(void)
 {
-	struct timerlist *ret;
+	struct cds_list_head *ret;
 	int i;
 
 	ret = calloc(NETCONS_RTO, sizeof(*ret));
@@ -199,172 +122,20 @@ static struct timerlist *create_timerlists(void)
 		fatal("Unable to allocate timerlist\n");
 
 	for (i = 0; i < NETCONS_RTO; i++)
-		timerlist_init(&ret[i]);
+		CDS_INIT_LIST_HEAD(&ret[i]);
 
 	return ret;
 }
 
-static void destroy_timerlists(struct timerlist *timerlist)
+static void destroy_timerlists(struct cds_list_head *timerlist)
 {
 	free(timerlist);
-}
-
-static struct hashtable *create_hashtable(int order, struct hashtable *old)
-{
-	struct hashtable *new;
-	struct bucket *bkt;
-	unsigned long i;
-
-	new = zalloc(sizeof(*new) + sizeof(struct bucket) * (1UL << order));
-	if (!new)
-		fatal("Unable to allocate hashtable\n");
-
-	new->order = order;
-
-	if (!old)
-		return new;
-
-	for (i = 0; i < (1UL << old->order); i++) {
-		if (old->table[i].ncrx) {
-			bkt = hlookup(new, &old->table[i].src);
-			memcpy(bkt, &old->table[i], sizeof(*bkt));
-
-			/*
-			 * If the timernode wasn't on a list, initialize it as
-			 * empty for the new bucket. If it was, update its
-			 * neighbors to point to the new bucket.
-			 */
-			if (bkt->timernode.next == &old->table[i].timernode) {
-				timerlist_init(&bkt->timernode);
-			} else {
-				bkt->timernode.next->prev = &bkt->timernode;
-				bkt->timernode.prev->next = &bkt->timernode;
-			}
-		}
-	}
-
-	new->load = old->load;
-
-	free(old);
-	return new;
-}
-
-static void destroy_hashtable(struct hashtable *ht)
-{
-	unsigned long i;
-
-	for (i = 0; i < (1UL << ht->order); i++)
-		if (ht->table[i].ncrx)
-			ncrx_destroy(ht->table[i].ncrx);
-
-	free(ht);
-}
-
-static void maybe_resize_hashtable(struct ncrx_worker *cur, unsigned long new)
-{
-	unsigned long neworder;
-
-	if ((cur->ht->load + new) >> (cur->ht->order - 2) < 3)
-		return;
-
-	/*
-	 * The hashtable is more than 75% full. Resize it such that it can take
-	 * @new additional client hosts and be less than 50% full.
-	 */
-	neworder = LONG_BIT - __builtin_clzl(cur->ht->load + new) + 1;
-	cur->ht = create_hashtable(neworder, cur->ht);
-}
-
-static void hdelete(struct hashtable *h, struct bucket *victim)
-{
-	struct bucket *old, *new;
-	unsigned long origidx, idx;
-
-	fatal_on(!victim->ncrx, "Attempt to delete free bucket\n");
-
-	if (!timerlist_empty(&victim->timernode))
-		timerlist_del(&victim->timernode);
-
-	h->load--;
-	ncrx_destroy(victim->ncrx);
-	memset(victim, 0, sizeof(*victim));
-
-	/*
-	 * There's potential to be clever here, but for now just be pedantic and
-	 * rebucket any potentially probed entries.
-	 */
-
-	origidx = victim - h->table;
-	idx = origidx;
-	while (h->table[idx].ncrx) {
-		old = &h->table[idx];
-		new = hlookup(h, &old->src);
-		if (new != old) {
-			memcpy(new, old, sizeof(*new));
-			memset(old, 0, sizeof(*old));
-
-			/*
-			 * If the timernode wasn't on a list, initialize it as
-			 * empty for the new bucket. If it was, update its
-			 * neighbors to point to the new bucket.
-			 */
-			if (new->timernode.next == &old->timernode) {
-				timerlist_init(&new->timernode);
-			} else {
-				new->timernode.next->prev = &new->timernode;
-				new->timernode.prev->next = &new->timernode;
-			}
-		}
-
-		idx = htable_mask(idx + 1, h->order);
-		fatal_on(idx == origidx, "Infinite loop in hdelete()\n");
-	}
-}
-
-/*
- * Simple garbage collection. This is meant to be rare (on the order of once per
- * hour), so maintaining an LRU list isn't worth the overhead: just blow through
- * the whole table. Worst case it's ~50MB.
- */
-static void try_to_garbage_collect(struct ncrx_worker *cur)
-{
-	unsigned long i, count = 0;
-	uint64_t now, end;
-	struct bucket *bkt;
-
-	now = now_mono_ms();
-	for (i = 0; i < (1UL << cur->ht->order); i++) {
-		bkt = &cur->ht->table[i];
-
-		if (bkt->ncrx && now - bkt->last_seen > cur->gc_age_ms) {
-			hdelete(cur->ht, bkt);
-			count++;
-		}
-	}
-	end = now_mono_ms();
-
-	log("Worker %d GC'd %lu in %" PRIu64 "ms\n", cur->thread_nr, count,
-			end - now);
-}
-
-static void maybe_garbage_collect(struct ncrx_worker *cur)
-{
-	uint64_t nowgc;
-
-	if (!cur->gc_int_ms)
-		return;
-
-	nowgc = now_mono_ms() / cur->gc_int_ms;
-	if (nowgc > cur->lastgc) {
-		try_to_garbage_collect(cur);
-		cur->lastgc = nowgc;
-	}
 }
 
 static void schedule_ncrx_callback(struct ncrx_worker *cur, struct bucket *bkt,
 		uint64_t when)
 {
-	struct timerlist *tgtlist;
+	struct cds_list_head *tgtlist;
 	uint64_t now;
 
 	if (when == UINT64_MAX) {
@@ -372,8 +143,8 @@ static void schedule_ncrx_callback(struct ncrx_worker *cur, struct bucket *bkt,
 		 * No callback needed. If we had one we no longer need it, so
 		 * just remove ourselves from the timerlist.
 		 */
-		if (!timerlist_empty(&bkt->timernode))
-			timerlist_del(&bkt->timernode);
+		if (!cds_list_empty(&bkt->timer_node))
+			cds_list_del_init(&bkt->timer_node);
 
 		return;
 	}
@@ -391,18 +162,18 @@ static void schedule_ncrx_callback(struct ncrx_worker *cur, struct bucket *bkt,
 	 * If the bucket is already on a timerlist, we only requeue it if the
 	 * callback needs to happen earlier than the one currently queued.
 	 */
-	if (!timerlist_empty(&bkt->timernode)) {
+	if (!cds_list_empty(&bkt->timer_node)) {
 		if (when > bkt->timernode.when)
 			return;
 
-		timerlist_del(&bkt->timernode);
+		cds_list_del_init(&bkt->timer_node);
 	}
 
 	tgtlist = &cur->tlist[when % NETCONS_RTO];
 	fatal_on(when < timerlist_peek(tgtlist), "Timerlist ordering broken\n");
 
 	bkt->timernode.when = when;
-	timerlist_append(&bkt->timernode, tgtlist);
+	cds_list_add_tail(&bkt->timer_node, tgtlist);
 	maybe_update_wake(cur, when);
 }
 
@@ -428,13 +199,14 @@ static void drain_bucket_ncrx(struct ncrx_worker *cur, struct bucket *bkt)
  * Execute callbacks for a specific timerlist, until either the list is empty or
  * we reach an entry that was queued for a time in the future.
  */
-static void do_ncrx_callbacks(struct ncrx_worker *cur, struct timerlist *list)
+static void do_ncrx_callbacks(struct ncrx_worker *cur,
+			      struct cds_list_head *list)
 {
 	uint64_t now = now_mono_ms();
-	struct timerlist *tnode, *tmp;
+	struct cds_list_head *tnode, *tmp;
 	struct bucket *bkt;
 
-	timerlist_for_each(tnode, tmp, list) {
+	cds_list_for_each_safe(tnode, tmp, list) {
 		if (tnode->when > now)
 			break;
 
@@ -442,7 +214,7 @@ static void do_ncrx_callbacks(struct ncrx_worker *cur, struct timerlist *list)
 		 * Remove the bucket from the list first, since it might end up
 		 * being re-added to another timerlist by drain_bucket_ncrx().
 		 */
-		timerlist_del(tnode);
+		cds_list_del_init(tnode);
 
 		bkt = bucket_from_timernode(tnode);
 		ncrx_process(NULL, now, 0, bkt->ncrx);
@@ -482,7 +254,7 @@ static void consume_msgbuf(struct ncrx_worker *cur, struct msg_buf *buf)
 	ncrx_bucket = hlookup(cur->ht, &buf->src.sin6_addr);
 	if (!ncrx_bucket->ncrx) {
 		ncrx_bucket->ncrx = ncrx_create(&ncrx_param);
-		timerlist_init(&ncrx_bucket->timernode);
+		cds_list_init(&ncrx_bucket->timer_node);
 		memcpy(&ncrx_bucket->src, &buf->src.sin6_addr,
 				sizeof(ncrx_bucket->src));
 		cur->ht->load++;
@@ -518,23 +290,22 @@ void *ncrx_worker_thread(void *arg)
 	uint64_t lastrun = now_mono_ms();
 	int nr_dequeued;
 
-	cur->ht = create_hashtable(16, NULL);
+	urcu_qsbr_register_thread();
 	cur->tlist = create_timerlists();
 
 	reset_waketime(cur);
 	pthread_mutex_lock(&cur->queuelock);
 	while (!cur->stop) {
+		urcu_qsbr_thread_offline();
 		pthread_cond_timedwait(&cur->cond, &cur->queuelock,
 				next_waketime(cur));
-
+		urcu_qsbr_thread_online();
 		reset_waketime(cur);
 morework:
 		curbuf = grab_prequeue(cur);
 		nr_dequeued = cur->nr_queued;
 		cur->nr_queued = 0;
 		pthread_mutex_unlock(&cur->queuelock);
-
-		maybe_resize_hashtable(cur, nr_dequeued);
 
 		while ((tmp = curbuf)) {
 			consume_msgbuf(cur, curbuf);
@@ -544,10 +315,10 @@ morework:
 			cur->processed++;
 		}
 
-		if (!cur->stop) {
-			maybe_garbage_collect(cur);
+		if (!cur->stop)
 			lastrun = run_ncrx_callbacks(cur, lastrun);
-		}
+
+		urcu_qsbr_quiescent_state();
 
 		pthread_mutex_lock(&cur->queuelock);
 		if (cur->queue_head)
@@ -559,6 +330,6 @@ morework:
 
 	cur->hosts_seen = cur->ht->load;
 	destroy_timerlists(cur->tlist);
-	destroy_hashtable(cur->ht);
+	urcu_qsbr_unregister_thread();
 	return NULL;
 }

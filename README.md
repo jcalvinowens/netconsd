@@ -17,10 +17,26 @@ own custom output module.
 
 ## Building netconsd
 
-The default Makefile target intended for production use has no external
-dependencies besides glibc. To build it, just say `make`: you'll end up with a
-single executable in this directory called `netconsd`, and a `*.so` file for every
-module in the `modules/` directory.
+Netconsd depends on the userspace-rcu library. You can easily install liburcu on
+all common open source operating systems:
+
+	$ sudo apt install liburcu-dev # Debian, Ubuntu
+	$ sudo dnf install liburcu-devel # Fedora, CentOS, RHEL
+	$ pkg install liburcu gmake # BSD
+	[...]
+
+On Linux, once liburcu is installed, just say `make`:
+
+	$ make
+
+The daemon itself is portable and supports BSD out of the box, but the build
+process is unfortunately somewhat Linux-specific. You can hackily build it with
+GNU make like this:
+
+	$ CPATH=/usr/local/include LIBRARY_PATH=/usr/local/lib gmake
+
+You'll end up with a single executable in this directory called `netconsd`, and
+a `*.so` file for every module in the `modules/` directory.
 
 The Makefile includes a few other handy targets:
 
@@ -170,6 +186,10 @@ build with `-static-libstdc++` and/or `-static-libgcc` to make this work.
 
 See the code and Makefile in `modules/` for some examples of the above.
 
+### Building liburcu
+
+	[[[ Explain how to link against a custom build of liburcu ]]]
+
 ## Contributing
 
 See the CONTRIBUTING file for how to help out.
@@ -180,5 +200,5 @@ netconsd is BSD licensed, see the LICENSE file for more information.
 
 netconsd was originally written by Calvin Owens as part of
 [fbkutils](https://github.com/facebookarchive/fbkutils) in 2016, with later
-contributions by several other people. This repository is a direct continuation
-of that codebase.
+contributions by several other people. The ncrx library was originally written
+by Tejun Heo. This repository is a direct continuation of that codebase.

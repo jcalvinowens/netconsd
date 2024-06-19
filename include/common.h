@@ -34,10 +34,6 @@
 
 #define clamp(val, lo, hi) min((typeof(val))max(val, lo), hi)
 
-#define container_of(ptr, type, member) ({			\
-	const typeof( ((type *)0)->member ) *__mptr = (ptr);	\
-	(type *)( (char *)__mptr - __builtin_offsetof(type,member) );})
-
 static inline void *zalloc(size_t n)
 {
 	return calloc(1, n);

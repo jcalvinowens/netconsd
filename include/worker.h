@@ -31,12 +31,8 @@ struct ncrx_worker {
 	int nr_queued;
 
 	struct hashtable *ht;
-	struct timerlist *tlist;
+	struct cds_list_head *tlist;
 	struct timespec wake;
-
-	unsigned int gc_age_ms;
-	unsigned int gc_int_ms;
-	uint64_t lastgc;
 
 	uint64_t processed;
 	uint64_t hosts_seen;

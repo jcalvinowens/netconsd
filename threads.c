@@ -24,6 +24,12 @@ struct tctl {
 	int nr_workers;
 	struct ncrx_listener *listeners;
 	struct ncrx_worker *workers;
+	struct cds_lfht *hashtable;
+
+	int gc_age_ms;
+	int gc_int_ms;
+	pthread_t gc_thread;
+	int gc_stop;
 };
 
 static void wake_thread(struct ncrx_listener *listener, int worker)
@@ -133,6 +139,13 @@ static void stop_and_wait_for_listeners(struct tctl *ctl)
 	free(ctl->listeners);
 }
 
+static void stop_and_wait_for_gc(struct tctl *ctl)
+{
+	ctl->gc_stop = 1;
+	pthread_kill(ctl->gc_thread, SIGUSR1);
+	pthread_join(ctl->gc_thread, NULL);
+}
+
 static void create_worker_threads(struct tctl *ctl, struct netconsd_params *p)
 {
 	struct ncrx_worker *cur, *workers;
@@ -198,16 +211,139 @@ static void create_listener_threads(struct tctl *ctl, struct netconsd_params *p)
 	ctl->listeners = listeners;
 }
 
+static void hfree(struct rcu_head *rcu)
+{
+	free(caa_container_of(head, struct rcu_head, rcu));
+}
+
+static void hdelete(struct hashtable *h, struct bucket *victim)
+{
+	fatal_on(!victim->ncrx, "Attempt to delete free bucket\n");
+
+	if (!cds_list_empty(&victim->timer_node))
+		cds_list_del_init(&victim->timer_node);
+
+	ncrx_destroy(victim->ncrx);
+
+	/*
+	 * The data structure allows concurrent deletes, but the GC is single
+	 * threaded, so that should never happen.
+	 */
+	fatal_on(cds_lfht_del(&victim->lfht_node), "Bucket double-deleted\n");
+	urcu_qsbr_call_rcu(&victim->rcu, hfree);
+}
+
+static struct bucket *bucket_from_hash_iter(struct cds_lfht_iter *iter)
+{
+	struct cds_lfht_node *node = cds_lfht_iter_get_node(iter);
+	return node ? caa_container_of(node, struct bucket, lfht_node) : NULL;
+}
+
+static void run_garbage_collection(uint64_t gc_age_ms)
+{
+	struct cds_lfht_node *node;
+	struct cds_lfht_iter iter;
+	uint64_t now, count = 0;
+
+	now = now_mono_ms();
+	cds_lfht_first(hashtable, &iter);
+	while ((node = cds_lfht_iter_get_node(&iter))) {
+		struct bucket *bkt = bucket_from_hash_iter(&iter);
+
+		if (bkt->ncrx && now - bkt->last_seen >= gc_age_ms) {
+			hdelete(hashtable, bkt);
+			count++;
+		}
+
+		cds_lfht_next(hashtable, &iter);
+	}
+
+	urcu_qsbr_quiescent_state();
+	log("GC'd %" PRIu64 " in %" PRIu64 "ms\n", count, now_mono_ms() - now);
+}
+
+static int new_timerfd(uint64_t interval_ms)
+{
+	const struct itimerspec t = {
+		.it_interval = {
+			.tv_sec = interval_ms / 1000ULL,
+			.tv_nsec = interval_ms % 1000ULL * 1000000ULL,
+		},
+		.it_value = {
+			.tv_sec = interval_ms / 1000ULL,
+			.tv_nsec = interval_ms % 1000ULL * 1000000ULL,
+		},
+	};
+	int fd;
+
+	fd = timerfd_create(CLOCK_MONOTONIC, 0);
+	if (fd == -1)
+		fatal("Can't make timerfd for GC thread\n");
+
+	if (timerfd_settime(fd, 0, &t, NULL))
+		fatal("Can't set timerfd for GC thread\n");
+
+	return fd;
+}
+
+static void *garbage_collector_thread(struct tctl *ctl)
+{
+	int tfd;
+
+	urcu_qsbr_register_thread();
+
+	tfd = new_timerfd(ctl->gc_int_ms);
+	while (!ctl->stop) {
+		uint64_t val;
+		int ret;
+
+		urcu_qsbr_thread_offline();
+		ret = read(tfd, &val, sizeof(val));
+		urcu_qsbr_thread_online();
+
+		if (ret != sizeof(val) && errno != EINTR)
+			fatal("Bad timer in GC thread\n");
+
+		if (val > 1)
+			log("GC thread missed %" PRIu64 " ticks\n");
+
+		run_garbage_collection(ctl->gc_age_ms);
+	}
+
+	close(tfd);
+	urcu_qsbr_unregister_thread();
+}
+
+static void create_gc_thread(struct tctl *ctl)
+{
+	int r;
+
+	r = pthread_create(&ctl->gc_thread, NULL, garbage_collector_thread,
+			   ctl);
+	if (r)
+		fatal("GC thread failed: -%d\n", r);
+}
+
 void destroy_threads(struct tctl *ctl)
 {
 	stop_and_wait_for_listeners(ctl);
 	stop_and_wait_for_workers(ctl);
+
+	stop_and_wait_for_gc(ctl);
+	run_garbage_collection(0);
+	urcu_qsbr_barrier();
+
+	cds_lfht_destroy(ctl->hashtable);
 	free(ctl);
+
+	urcu_qsbr_unregister_thread();
 }
 
 struct tctl *create_threads(struct netconsd_params *p)
 {
 	struct tctl *ret;
+
+	urcu_qsbr_register_thread();
 
 	ret = calloc(1, sizeof(*ret));
 	if (!ret)
@@ -217,6 +353,10 @@ struct tctl *create_threads(struct netconsd_params *p)
 
 	create_worker_threads(ret, p);
 	create_listener_threads(ret, p);
+
+	ctl->gc_age_ms = p->gc_age_ms;
+	ctl->gc_int_ms = p->gc_int_ms;
+	create_gc_thread(ret);
 
 	return ret;
 }

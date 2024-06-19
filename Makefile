@@ -1,6 +1,6 @@
 CC ?= gcc
 
-LIBS = -lpthread -lrt -ldl
+LIBS = -lpthread -lrt -ldl -lurcu-qsbr -lurcu-cds -lurcu-common
 CFLAGS ?= -O2 -fPIC
 CFLAGS += -D_GNU_SOURCE -fno-strict-aliasing -Wall -Wextra \
           -Wstrict-prototypes -Wmissing-prototypes -Wmissing-declarations \
