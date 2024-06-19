@@ -18,9 +18,9 @@ own custom output module.
 ## Building netconsd
 
 The default Makefile target intended for production use has no external
-dependencies besides glibc. To build it, just say `make`: you'll end up with a
-single executable in this directory called `netconsd`, and a `*.so` file for every
-module in the `modules/` directory.
+dependencies besides glibc. To build it, just say `make` (or `gmake` on BSD):
+you'll end up with a single executable in this directory called `netconsd`, and
+a `*.so` file for every module in the `modules/` directory.
 
 The Makefile includes a few other handy targets:
 
@@ -180,5 +180,5 @@ netconsd is BSD licensed, see the LICENSE file for more information.
 
 netconsd was originally written by Calvin Owens as part of
 [fbkutils](https://github.com/facebookarchive/fbkutils) in 2016, with later
-contributions by several other people. This repository is a direct continuation
-of that codebase.
+contributions by several other people. The ncrx library was originally written
+by Tejun Heo. This repository is a direct continuation of that codebase.
