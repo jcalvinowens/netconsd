@@ -9,6 +9,8 @@ CFLAGS += -D_GNU_SOURCE -fno-strict-aliasing -Wall -Wextra \
 CPPFLAGS ?=
 INCLUDES = -Incrx
 
+# FIXME: OpenBSD fails if -lrt or -ldl are passed
+
 debug debug32: CFLAGS += -O0 -gdwarf-4 -fno-omit-frame-pointer \
 	                 -fstack-protector-all -fsanitize=address \
                          -fsanitize=undefined
